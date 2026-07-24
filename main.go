@@ -7,22 +7,22 @@ import (
 	"net"
 	"os"
 	"sync"
+	"sync/atomic"
+	"time"
 )
 
 const (
 	HOST        = "127.0.0.1"
 	PORT        = "4242"
-	PACKET_SIZE = 18 // 16 Bytes Payload + 2 Bytes CRC16
+	PACKET_SIZE = 18
 )
 
-// SensorPayload represents the 16-byte unpacked structure
 type SensorPayload struct {
 	DeviceID  uint32
 	Timestamp uint64
 	Temp      float32
 }
 
-// Memory Pool for zero-allocation buffer recycling
 var bufferPool = sync.Pool{
 	New: func() interface{} {
 		b := make([]byte, 1024)
@@ -30,14 +30,13 @@ var bufferPool = sync.Pool{
 	},
 }
 
-// Fast Table-based CRC16 Validation
 func calculateCRC16(data []byte) uint16 {
 	var crc uint16 = 0xFFFF
 	for _, b := range data {
 		curByte := uint16(b)
 		for i := 0; i < 8; i++ {
 			if (crc^curByte)&0x0001 != 0 {
-				crc = (crc >> 1) ^ 0xA001 // Standard Modbus CRC16 Polynomial
+				crc = (crc >> 1) ^ 0xA001
 			} else {
 				crc >>= 1
 			}
@@ -46,6 +45,14 @@ func calculateCRC16(data []byte) uint16 {
 	}
 	return crc
 }
+
+// Metrics Counters
+var (
+	totalPackets uint64
+	validPackets uint64
+	crcErrors    uint64
+	lengthErrors uint64
+)
 
 func main() {
 	addr, err := net.ResolveUDPAddr("udp", HOST+":"+PORT)
@@ -61,25 +68,44 @@ func main() {
 	}
 	defer conn.Close()
 
-	// Socket Receive Buffer Size 8MB-তে বাড়িয়ে দেওয়া (High Throughput-এর জন্য)
-	conn.SetReadBuffer(8 * 1024 * 1024)
+	// Socket Receive Buffer Size 16MB তে বাড়িয়ে দেওয়া (High Throughput এর জন্য)
+	conn.SetReadBuffer(16 * 1024 * 1024)
 
-	fmt.Printf("🚀 Ultra-Fast Ingest Engine Live! Listening on UDP %s:%s...\n", HOST, PORT)
+	fmt.Printf("🚀 Ultra-Fast Benchmarking Ingest Engine Live! UDP %s:%s...\n", HOST, PORT)
+
+	// Live Metrics Dashboard Routine (Every 1 Second)
+	go func() {
+		ticker := time.NewTicker(1 * time.Second)
+		var prevTotal uint64
+		for range ticker.C {
+			currTotal := atomic.LoadUint64(&totalPackets)
+			currValid := atomic.LoadUint64(&validPackets)
+			currCrcErr := atomic.LoadUint64(&crcErrors)
+			currLenErr := atomic.LoadUint64(&lengthErrors)
+
+			pps := currTotal - prevTotal
+			prevTotal = currTotal
+
+			fmt.Printf("📊 [METRICS] Speed: %d pkts/sec | Total Received: %d | Valid: %d | Bad CRC: %d | Bad Size: %d\n",
+				pps, currTotal, currValid, currCrcErr, currLenErr)
+		}
+	}()
 
 	for {
-		// sync.Pool থেকে বাফার ধার নেওয়া
 		bufPtr := bufferPool.Get().(*[]byte)
 		buffer := *bufPtr
 
-		n, remoteAddr, err := conn.ReadFromUDP(buffer)
+		n, _, err := conn.ReadFromUDP(buffer)
 		if err != nil {
 			bufferPool.Put(bufPtr)
 			continue
 		}
 
+		atomic.AddUint64(&totalPackets, 1)
+
 		// Guardrail 1: Packet Length Check
 		if n != PACKET_SIZE {
-			fmt.Printf("⚠️ Corrupt/Invalid packet length (%d bytes) from %s. Dropping!\n", n, remoteAddr)
+			atomic.AddUint64(&lengthErrors, 1)
 			bufferPool.Put(bufPtr)
 			continue
 		}
@@ -90,22 +116,20 @@ func main() {
 		calculatedCRC := calculateCRC16(payloadBytes)
 
 		if receivedCRC != calculatedCRC {
-			fmt.Printf("❌ CRC Mismatch! Received: 0x%X, Calculated: 0x%X. Dropping!\n", receivedCRC, calculatedCRC)
+			atomic.AddUint64(&crcErrors, 1)
 			bufferPool.Put(bufPtr)
 			continue
 		}
 
-		// Direct Binary Unpacking (O(1) Speed)
+		// Direct Binary Parsing (O(1) Speed)
 		var payload SensorPayload
 		payload.DeviceID = binary.LittleEndian.Uint32(buffer[0:4])
 		payload.Timestamp = binary.LittleEndian.Uint64(buffer[4:12])
 		tempBits := binary.LittleEndian.Uint32(buffer[12:16])
 		payload.Temp = math.Float32frombits(tempBits)
 
-		fmt.Printf("✅ [Valid Packet] DevID: %d | Time: %d | Temp: %.2f°C (From %s)\n",
-			payload.DeviceID, payload.Timestamp, payload.Temp, remoteAddr)
+		atomic.AddUint64(&validPackets, 1)
 
-		// প্রসেস শেষে বাফার পুলে ফেরত দেওয়া
 		bufferPool.Put(bufPtr)
 	}
 }
