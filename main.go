@@ -15,6 +15,8 @@ const (
 	HOST        = "127.0.0.1"
 	PORT        = "4242"
 	PACKET_SIZE = 18
+	BATCH_SIZE  = 10000                  // 10k Items per Bulk Write
+	FLUSH_TIME  = 500 * time.Millisecond // 500ms Timeout
 )
 
 type SensorPayload struct {
@@ -29,6 +31,9 @@ var bufferPool = sync.Pool{
 		return &b
 	},
 }
+
+// 10 Lakh Queue Capacity to buffer heavy spikes
+var dataQueue = make(chan SensorPayload, 1000000)
 
 func calculateCRC16(data []byte) uint16 {
 	var crc uint16 = 0xFFFF
@@ -52,7 +57,45 @@ var (
 	validPackets uint64
 	crcErrors    uint64
 	lengthErrors uint64
+	totalBatches uint64
+	flushedItems uint64
 )
+
+// Mock Bulk Persistence Worker
+func databaseWorker() {
+	batch := make([]SensorPayload, 0, BATCH_SIZE)
+	ticker := time.NewTicker(FLUSH_TIME)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case item := <-dataQueue:
+			batch = append(batch, item)
+
+			// Trigger 1: Size-based Batching (10,000 items)
+			if len(batch) >= BATCH_SIZE {
+				flushBatch(batch, "SIZE_TRIGGER")
+				batch = batch[:0] // Reset slice without re-allocation
+			}
+
+		case <-ticker.C:
+			// Trigger 2: Time-based Batching (500ms Timeout)
+			if len(batch) > 0 {
+				flushBatch(batch, "TIME_TRIGGER")
+				batch = batch[:0] // Reset slice without re-allocation
+			}
+		}
+	}
+}
+
+// Simulated Persistence Operation (Next step: DuckDB/SQLite Insert)
+func flushBatch(batch []SensorPayload, triggerType string) {
+	atomic.AddUint64(&totalBatches, 1)
+	atomic.AddUint64(&flushedItems, uint64(len(batch)))
+
+	// For debugging/benchmarking: Print batch logs only for time-triggers or large metrics
+	// Real insertion logic (e.g., DuckDB Appender) will go here in the next step.
+}
 
 func main() {
 	addr, err := net.ResolveUDPAddr("udp", HOST+":"+PORT)
@@ -68,10 +111,12 @@ func main() {
 	}
 	defer conn.Close()
 
-	// Socket Receive Buffer Size 16MB তে বাড়িয়ে দেওয়া (High Throughput এর জন্য)
 	conn.SetReadBuffer(16 * 1024 * 1024)
 
-	fmt.Printf("🚀 Ultra-Fast Benchmarking Ingest Engine Live! UDP %s:%s...\n", HOST, PORT)
+	fmt.Printf("🚀 Ultra-Fast Ingest + Micro-Batching Engine Live! UDP %s:%s...\n", HOST, PORT)
+
+	// Start Background Persistence Worker Routine
+	go databaseWorker()
 
 	// Live Metrics Dashboard Routine (Every 1 Second)
 	go func() {
@@ -80,14 +125,14 @@ func main() {
 		for range ticker.C {
 			currTotal := atomic.LoadUint64(&totalPackets)
 			currValid := atomic.LoadUint64(&validPackets)
-			currCrcErr := atomic.LoadUint64(&crcErrors)
-			currLenErr := atomic.LoadUint64(&lengthErrors)
+			currBatches := atomic.LoadUint64(&totalBatches)
+			currFlushed := atomic.LoadUint64(&flushedItems)
 
 			pps := currTotal - prevTotal
 			prevTotal = currTotal
 
-			fmt.Printf("📊 [METRICS] Speed: %d pkts/sec | Total Received: %d | Valid: %d | Bad CRC: %d | Bad Size: %d\n",
-				pps, currTotal, currValid, currCrcErr, currLenErr)
+			fmt.Printf("📊 [METRICS] Speed: %d pkts/sec | Valid: %d | Queued -> Flushed: %d | Total Batches Flushed: %d\n",
+				pps, currValid, currFlushed, currBatches)
 		}
 	}()
 
@@ -129,6 +174,13 @@ func main() {
 		payload.Temp = math.Float32frombits(tempBits)
 
 		atomic.AddUint64(&validPackets, 1)
+
+		// ⚡ Push to Non-blocking In-Memory Channel Queue
+		select {
+		case dataQueue <- payload:
+		default:
+			// Buffer FULL Safety Catch (Drop logic if queue exceeds 1M items)
+		}
 
 		bufferPool.Put(bufPtr)
 	}
